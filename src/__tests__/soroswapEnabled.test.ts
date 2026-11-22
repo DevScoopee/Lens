@@ -38,7 +38,7 @@ vi.mock('../db', () => ({
 }))
 vi.mock('../webhookDispatcher', () => ({ dispatchPriceUpdate: vi.fn().mockResolvedValue(undefined) }))
 
-import { startSoroswapIngester } from '../ingesters/soroswap'
+import { startSoroswapIngester } from '../ingest/venues/soroswap'
 
 describe('startSoroswapIngester', () => {
   beforeEach(() => {

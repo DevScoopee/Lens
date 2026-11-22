@@ -67,9 +67,9 @@ import {
   price_snapshots_total,
   last_trade_timestamp,
 } from '../src/metrics'
-import { ingestPair } from '../src/ingesters/sdex'
-import { snapshotPool, ingestPoolTrades } from '../src/ingesters/amm'
-import { appendSnapshots } from '../src/ingesters/snapshot'
+import { ingestPair } from '../src/ingest/venues/sdex'
+import { snapshotPool, ingestPoolTrades } from '../src/ingest/venues/amm'
+import { appendSnapshots } from '../src/ingest/snapshot'
 
 const USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN'
 
@@ -217,6 +217,9 @@ describe('last_trade_timestamp', () => {
 
   it('tracks the AMM loop per network too', async () => {
     global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
       json: async () => ({
         _embedded: {
           records: [

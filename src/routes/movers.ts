@@ -3,6 +3,7 @@ import { pgPool } from '../db'
 import { activeNetwork, type NetworkName } from '../config'
 import '../middleware/network'
 
+import { apiError } from '../errors'
 // Supported windows -> lookback in hours.
 const WINDOW_HOURS = {
   '1h': 1,
@@ -55,13 +56,13 @@ export async function registerMoversRoutes(app: FastifyInstance) {
     if (!(rawWindow in WINDOW_HOURS)) {
       return reply
         .status(400)
-        .send({ error: `window must be one of: ${WINDOWS.join(', ')}` })
+        .send(apiError('bad_window', `window must be one of: ${WINDOWS.join(', ')}`))
     }
     const window = rawWindow as MoversWindow
 
     const requested = req.query.network
     if (requested !== undefined && requested !== 'testnet' && requested !== 'mainnet') {
-      return reply.status(400).send({ error: 'network must be one of: testnet, mainnet' })
+      return reply.status(400).send(apiError('bad_network', 'network must be one of: testnet, mainnet'))
     }
     const network: NetworkName = req.network ?? (requested as NetworkName) ?? activeNetwork
 
@@ -79,7 +80,7 @@ export async function registerMoversRoutes(app: FastifyInstance) {
             (array_agg(asset_b))[1] AS asset_b,
             (array_agg(price::float ORDER BY timestamp ASC))[1] AS start_price,
             (array_agg(price::float ORDER BY timestamp DESC))[1] AS end_price,
-            SUM(base_volume::float) AS current_volume,
+            SUM(base_volume)::float AS current_volume,
             array_agg(DISTINCT source) AS venues,
             COUNT(*)::int AS sample_count,
             MAX(timestamp) AS last_updated
@@ -92,7 +93,7 @@ export async function registerMoversRoutes(app: FastifyInstance) {
         prev_window AS (
           SELECT
             pair_key,
-            SUM(base_volume::float) AS prev_volume
+            SUM(base_volume)::float AS prev_volume
           FROM price_points
           WHERE network = $1
             AND timestamp >= $4
@@ -186,7 +187,7 @@ export async function registerMoversRoutes(app: FastifyInstance) {
       return response
     } catch (err) {
       req.log.error(err, '[movers] Movers aggregation failed')
-      return reply.status(500).send({ error: 'Internal server error' })
+      return reply.status(500).send(apiError('internal_error', 'Internal server error'))
     }
   })
 }

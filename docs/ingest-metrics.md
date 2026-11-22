@@ -42,7 +42,7 @@ inserted-only set, so a replay cannot masquerade as a fresh observation.
 Both price-point counters are labelled by `source` and `network` only: a pool
 id or pair key per row would make the series count grow with on-chain pools.
 
-## Why `network` is on all four
+## Why `network` is on all five
 
 Before this change, the ingest metrics were network-blind. On a dual-network
 deployment the two loops wrote to the same series.
@@ -53,7 +53,7 @@ queryable at all.
 
 `last_trade_timestamp` was worse. It is a `Gauge.set()`, not an increment, so
 whichever loop ticked last won. The testnet loop at
-[`src/ingesters/sdex.ts`](../src/ingesters/sdex.ts) overwrote mainnet's value
+[`src/ingest/venues/sdex.ts`](../src/ingest/venues/sdex.ts) overwrote mainnet's value
 for the same pair every poll interval, and the series reported a timestamp
 belonging to exactly one network while looking network-agnostic. That is the
 only staleness signal Lens exports, and on a dual-network deployment it was
@@ -117,6 +117,9 @@ time() - last_trade_timestamp{pair="XLM/USDC", network="mainnet"}
 
 # Pairs that have gone quiet in the last 15 minutes
 time() - last_trade_timestamp > 900
+
+# Which ingester loop is overrunning its cycle deadline, on which network
+sum(rate(ingester_abandoned_cycles_total[15m])) by (venue, network)
 ```
 
 ## Suggested alerts

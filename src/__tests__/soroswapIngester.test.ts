@@ -64,7 +64,7 @@ import {
   isPricePlausible,
   type PoolEntry,
   type SoroswapToken,
-} from '../ingesters/soroswap'
+} from '../ingest/venues/soroswap'
 import { upsertPricePoints } from '../db'
 import { dispatchPriceUpdate } from '../webhookDispatcher'
 import { publishPriceUpdate } from '../events'
@@ -178,6 +178,12 @@ describe('ingestPool', () => {
   }
 
   beforeEach(() => {
+    // `clearAllMocks` clears calls but leaves implementations in place, so the
+    // `mockRejectedValue` set by the "does not throw when upsertPricePoints
+    // rejects" case below would otherwise survive into whichever test runs
+    // next. Under a shuffled run that poisons this test (upsertPricePoints
+    // rejects, ingestPool bails early, dispatchPriceUpdate is never called),
+    // so re-establish the default resolution every time.
     vi.clearAllMocks()
     ;(upsertPricePoints as ReturnType<typeof vi.fn>).mockImplementation((points: any[]) => ({
       inserted: points,
@@ -248,7 +254,12 @@ describe('ingestPool', () => {
 
   it('does not throw when upsertPricePoints rejects', async () => {
     const mockFetch = vi.fn().mockResolvedValue([1000n, 200n])
-    ;(upsertPricePoints as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('DB error'))
+    // `...Once`: this rejection must not outlive this test. `beforeEach` only
+    // calls `vi.clearAllMocks()`, which resets call history but NOT mock
+    // implementations, so a persistent `mockRejectedValue` here would leak into
+    // whichever test runs next — and test order is shuffled in CI, so the
+    // victim (e.g. "stores a price point") would fail intermittently.
+    ;(upsertPricePoints as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('DB error'))
 
     await expect(ingestPool(mockPoolEntry, mockPair as any, mockFetch)).resolves.toBeUndefined()
   })

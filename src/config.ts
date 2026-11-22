@@ -9,6 +9,25 @@ const log = createLogger('config')
 
 export type NetworkName = 'testnet' | 'mainnet'
 
+/**
+ * Default peg deviation tolerance in basis points (100 bps = 1.0%).
+ * Shared across GET /snapshot (PEG_TOLERANCE_BPS = 100) and the peg-deviation
+ * alerting state machine (#322, default band = 0.01 = 100 bps) so query routes
+ * and alerts agree on what counts as within-band versus depegged.
+ */
+export const DEFAULT_PEG_TOLERANCE_BPS = 100
+
+export interface PeggedAssetConfig {
+  /** The pegged asset (e.g. USDC, EURC, etc.) */
+  asset: AssetId
+  /** The target code or asset it is pegged to (e.g. "USD", "EUR") */
+  target: string
+  /** The explicit numeric target price against target (e.g. 1.0) */
+  targetPrice: number
+  /** Lookback window in hours for rolling worst deviation (default: 24) */
+  windowHours?: number
+}
+
 /** Per-network configuration block. */
 export interface NetworkConfig {
   horizon: {
@@ -36,11 +55,46 @@ export interface NetworkConfig {
     /** Aquarius AMM pools API base URL for this network. */
     apiUrl: string
   }
+  defindex: {
+    /** Whether DeFindex has a usable deployment on this network. */
+    enabled: boolean
+    /**
+     * DeFindex factory contract id — the on-chain registry used to enumerate
+     * vaults (56-char `C...`). Sourced from the protocol's own
+     * `*.contracts.json`; a malformed id disables the venue.
+     */
+    factoryAddress: string
+    /** How often to poll DeFindex vault share prices in ms. */
+    pollIntervalMs: number
+  }
+  phoenix: {
+    /** Whether Phoenix has a usable deployment on this network. */
+    enabled: boolean
+    /**
+     * Phoenix factory contract id for this network. Pools are enumerated from
+     * it (`query_pools`) rather than from a list kept in this repo.
+     */
+    factoryAddress: string
+    /** How often to poll Phoenix pool reserves in ms. */
+    pollIntervalMs: number
+    /** How long the discovered pool list is reused before re-enumerating, in ms. */
+    poolCacheTtlMs: number
+  }
   oracle: {
     /** Whether the Reflector oracle is deployed on this network. */
     enabled: boolean
     /** Reflector oracle contract ID for this network. */
     reflectorContractId: string
+  }
+  blend: {
+    /** Whether Blend lending rate ingestion is enabled on this network. */
+    enabled: boolean
+    /** Blend pool contract addresses for this network. */
+    pools: string[]
+    /** Blend backstop contract address for this network. */
+    backstopContractId: string
+    /** How often to poll Blend pool reserves in ms. */
+    pollIntervalMs: number
   }
   /**
    * The SEP-40 publisher — the one direction that writes. `oracle` above is
@@ -61,6 +115,8 @@ export interface NetworkConfig {
   }
   /** Watched asset pairs for this network. */
   pairs: WatchedPair[]
+  /** Configured pegged assets for this network. */
+  pegged: PeggedAssetConfig[]
   routing: {
     /** Maximum hop depth for multi-hop routing (default: 3) */
     maxHops: number
@@ -142,6 +198,12 @@ const TESTNET_DEFAULT_INTERMEDIATES =
 const MAINNET_DEFAULT_INTERMEDIATES =
   'XLM:native,USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN'
 
+export const TESTNET_DEFAULT_PEGGED =
+  'USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5=USD:1.0'
+
+export const MAINNET_DEFAULT_PEGGED =
+  'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN=USD:1.0'
+
 function parseIntermediateAssets(raw: string): AssetId[] {
   if (!raw.trim()) return []
   return raw.split(',').map(a => parseAsset(a.trim()))
@@ -159,6 +221,42 @@ function parseWatchedPairs(raw: string): WatchedPair[] {
     const assetA = parseAsset(a)
     const assetB = parseAsset(b)
     return { assetA, assetB, pairKey: makePairKey(assetA, assetB) }
+  })
+}
+
+// ── Pegged assets parsing ───────────────────────────────────────────────────
+
+export function parsePeggedAssets(raw: string): PeggedAssetConfig[] {
+  if (!raw.trim()) return []
+  return raw.split(',').map(entry => {
+    // format: ASSET[:ISSUER]=TARGET:TARGET_PRICE[:WINDOW_HOURS]
+    // e.g. "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN=USD:1.0"
+    const [assetStr, targetDef] = entry.trim().split('=')
+    if (!assetStr || !targetDef) {
+      throw new Error(
+        `Invalid pegged asset format: "${entry}". Expected "ASSET[:ISSUER]=TARGET:TARGET_PRICE[:WINDOW_HOURS]"`
+      )
+    }
+    const asset = parseAsset(assetStr)
+    const targetParts = targetDef.split(':')
+    const target = targetParts[0]?.trim().toUpperCase()
+    const rawTargetPrice = targetParts[1]?.trim()
+    if (!target || !rawTargetPrice) {
+      throw new Error(
+        `Invalid pegged asset format: "${entry}". Expected "ASSET[:ISSUER]=TARGET:TARGET_PRICE[:WINDOW_HOURS]"`
+      )
+    }
+    const targetPrice = Number(rawTargetPrice)
+    if (!Number.isFinite(targetPrice) || targetPrice <= 0) {
+      throw new Error(`Invalid target price in pegged asset: "${entry}"`)
+    }
+    const windowHours = targetParts[2] ? parseInt(targetParts[2], 10) : undefined
+    return {
+      asset,
+      target,
+      targetPrice,
+      windowHours: windowHours && !isNaN(windowHours) && windowHours > 0 ? windowHours : 24,
+    }
   })
 }
 
@@ -250,6 +348,64 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
   const aquariusEnabled =
     (process.env[`AQUARIUS_ENABLED_${suffix}`] ?? (network === 'mainnet' ? 'true' : 'false')).toLowerCase() !== 'false'
 
+  // ── DeFindex vault factory ────────────────────────────────────────────────
+  // DeFindex vaults are enumerable from the factory contract. The factory ids
+  // below are copied whole from the protocol's published deployments —
+  // https://github.com/defindex-io/stellar-contracts (public/mainnet.contracts.json
+  // and public/testnet.contracts.json). Testnet redeploys often, so override
+  // with DEFINDEX_FACTORY_ADDRESS_TESTNET when the published id changes.
+  const defindexFactory =
+    process.env[`DEFINDEX_FACTORY_ADDRESS_${suffix}`] ||
+    process.env.DEFINDEX_FACTORY_ADDRESS ||
+    (network === 'mainnet'
+      ? 'CDKFHFJIET3A73A2YN4KV7NSV32S6YGQMUFH3DNJXLBWL4SKEGVRNFKI'
+      : 'CDSCWE4GLNBYYTES2OCYDFQA2LLY4RBIAX6ZI32VSUXD7GO6HRPO4A32')
+
+  const defindexEnabled =
+    (process.env[`DEFINDEX_ENABLED_${suffix}`] ?? 'true').toLowerCase() !== 'false' &&
+    isUsableContractId(defindexFactory, `DEFINDEX_FACTORY_ADDRESS_${suffix}`)
+
+  const defindexPollMs = parseInt(
+    process.env[`DEFINDEX_POLL_INTERVAL_MS_${suffix}`] ||
+    process.env.DEFINDEX_POLL_INTERVAL_MS ||
+    '60000',
+    10
+  )
+
+  // ── Phoenix AMM (Soroban) ─────────────────────────────────────────────────
+  // Mainnet factory id taken verbatim from Phoenix's own repository —
+  // scripts/extend-queries.sh and scripts/deploy_pool.sh both set
+  // FACTORY="CB4SVAWJA6TSRNOJZ7W2AWFW46D5VR4ZMFZKDIKXEINZCZEGZCJZCKMI"
+  // alongside RPC_URL=https://mainnet.sorobanrpc.com and the public-network
+  // passphrase (https://github.com/Phoenix-Protocol-Group/phoenix-contracts).
+  //
+  // There is no built-in testnet id: Phoenix does not publish a testnet
+  // deployment, so a testnet factory only exists if an operator deploys one and
+  // names it here. An id that is empty or malformed leaves the venue disabled
+  // on that network rather than pointing the ingester at something invented.
+  const phoenixFactory =
+    process.env[`PHOENIX_FACTORY_ADDRESS_${suffix}`] ||
+    (network === 'testnet' ? process.env.PHOENIX_FACTORY_ADDRESS : undefined) ||
+    (network === 'mainnet'
+      ? 'CB4SVAWJA6TSRNOJZ7W2AWFW46D5VR4ZMFZKDIKXEINZCZEGZCJZCKMI'
+      : '')
+
+  const phoenixEnabled =
+    (process.env[`PHOENIX_ENABLED_${suffix}`] ?? 'true').toLowerCase() !== 'false' &&
+    isUsableContractId(phoenixFactory, `PHOENIX_FACTORY_ADDRESS_${suffix}`)
+
+  const phoenixPollMs = parseInt(
+    process.env.PHOENIX_POLL_INTERVAL_MS || '60000',
+    10
+  )
+
+  // Pool enumeration is one RPC read of the whole factory, so it is reused
+  // across pairs and cycles instead of being paid for on every price poll.
+  const phoenixPoolCacheTtlMs = parseInt(
+    process.env.PHOENIX_POOL_CACHE_TTL_MS || '600000',
+    10
+  )
+
   // ── Reflector oracle ──────────────────────────────────────────────────────
   // No built-in default: the previous mainnet literal was a malformed
   // (55-character) id and a replacement could not be verified against
@@ -264,6 +420,47 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
     (process.env[`REFLECTOR_ENABLED_${suffix}`] ?? 'true').toLowerCase() !== 'false' &&
     isUsableContractId(reflectorContractId, `REFLECTOR_CONTRACT_ID_${suffix}`)
 
+  // ── Blend lending protocol ────────────────────────────────────────────────
+  const MAINNET_BLEND_POOLS = [
+    'CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD', // Fixed Pool v2
+    'CCCCIQSDILITHMM7PBSLVDT5MISSY7R26MNZXCX4H7J5JQ5FPIYOGYFS', // YieldBlox Pool v2
+    'CDVQVKOY2YSXS2IC7KN6MNASSHPAO7UN2UR2ON4OI2SKMFJNVAMDX6DP', // Fixed Pool v1
+    'CBP7NO6F7FRDHSOFQBT2L2UWYIZ2PU76JKVRYAQTG3KZSQLYAOKIF2WB', // YieldBlox Pool v1
+  ]
+  const MAINNET_BLEND_BACKSTOP = 'CAQQR5SWBXKIGZKPBZDH3KM5GQ5GUTPKB7JAFCINLZBC5WXPJKRG3IM7'
+
+  const TESTNET_BLEND_POOLS = [
+    'CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF', // TestnetV2 Pool
+  ]
+  const TESTNET_BLEND_BACKSTOP = 'CBDVWXT433PRVTUNM56C3JREF3HIZHRBA64NB2C3B2UNCKIS65ZYCLZA'
+
+  const blendBackstop =
+    process.env[`BLEND_BACKSTOP_${suffix}`] ||
+    (network === 'testnet' ? process.env.BLEND_BACKSTOP : undefined) ||
+    (network === 'mainnet' ? MAINNET_BLEND_BACKSTOP : TESTNET_BLEND_BACKSTOP)
+
+  const rawBlendPools =
+    process.env[`BLEND_POOLS_${suffix}`] ||
+    (network === 'testnet' ? process.env.BLEND_POOLS : undefined)
+
+  const parsedBlendPools: string[] = rawBlendPools
+    ? rawBlendPools
+        .split(',')
+        .map(p => p.trim())
+        .filter(p => isUsableContractId(p, `BLEND_POOLS_${suffix}`))
+    : (network === 'mainnet' ? MAINNET_BLEND_POOLS : TESTNET_BLEND_POOLS)
+
+  const blendEnabled =
+    (process.env[`BLEND_ENABLED_${suffix}`] ?? (network === 'testnet' ? (process.env.BLEND_ENABLED ?? 'true') : 'true')).toLowerCase() !== 'false' &&
+    parsedBlendPools.length > 0 &&
+    isUsableContractId(blendBackstop, `BLEND_BACKSTOP_${suffix}`)
+
+  const blendPollMs = parseInt(
+    process.env[`BLEND_POLL_INTERVAL_MS_${suffix}`] ||
+    process.env.BLEND_POLL_INTERVAL_MS ||
+    '60000',
+    10
+  )
   // ── SEP-40 publisher ──────────────────────────────────────────────────────
   // Off unless a contract is deployed AND a key is provided. There is no
   // default contract id: the feed is deployed by the operator (see
@@ -310,6 +507,19 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
     (network === 'testnet' ? process.env.WATCHED_PAIRS : undefined) ||
     (network === 'mainnet' ? MAINNET_DEFAULT_PAIRS : '')
 
+  // ── Pegged assets ─────────────────────────────────────────────────────────
+  // Defaults to Circle USDC pegged to USD at 1.0 on each network (matching
+  // MAINNET_DEFAULT_PAIRS and TESTNET_DEFAULT_INTERMEDIATES) so an instance
+  // that leaves PEGGED_ASSETS_* unset still reports the canonical USD
+  // stablecoin peg out of the box rather than returning []. Setting
+  // PEGGED_ASSETS_<NETWORK>="" explicitly still yields [].
+  const defaultPegged =
+    network === 'mainnet' ? MAINNET_DEFAULT_PEGGED : TESTNET_DEFAULT_PEGGED
+  const rawPegged =
+    process.env[`PEGGED_ASSETS_${suffix}`] ??
+    process.env.PEGGED_ASSETS ??
+    defaultPegged
+
   // ── Multi-hop Routing ───────────────────────────────────────────────────
   const maxHopsRaw =
     process.env[`ROUTING_MAX_HOPS_${suffix}`] ||
@@ -351,13 +561,31 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
       enabled: aquariusEnabled,
       apiUrl: aquariusApiUrl,
     },
+    defindex: {
+      enabled: defindexEnabled,
+      factoryAddress: defindexFactory,
+      pollIntervalMs: defindexPollMs,
+    },
+    phoenix: {
+      enabled: phoenixEnabled,
+      factoryAddress: phoenixFactory,
+      pollIntervalMs: phoenixPollMs,
+      poolCacheTtlMs: phoenixPoolCacheTtlMs,
+    },
     oracle: { enabled: oracleEnabled, reflectorContractId },
+    blend: {
+      enabled: blendEnabled,
+      pools: parsedBlendPools,
+      backstopContractId: blendBackstop,
+      pollIntervalMs: blendPollMs,
+    },
     publisher: {
       enabled: publisherEnabled,
       contractId: sep40ContractId,
       secretKey: sep40SecretKey,
     },
     pairs: parseWatchedPairs(rawPairs),
+    pegged: parsePeggedAssets(rawPegged),
     routing: { maxHops, intermediates },
     facilitator: { secretKey: facilitatorSecretKey, feeStroops: facilitatorFeeStroops },
   }
@@ -365,9 +593,28 @@ function buildNetworkConfig(network: NetworkName): NetworkConfig {
 
 // ── Global (non-network-specific) config ──────────────────────────────────────
 
+function parsePairThresholds(raw: string | undefined): Record<string, number> {
+  if (!raw || !raw.trim()) return {}
+  const overrides: Record<string, number> = {}
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim()
+    const lastColon = trimmed.lastIndexOf(':')
+    if (lastColon > 0) {
+      const pair = trimmed.slice(0, lastColon).trim().toUpperCase()
+      const val = parseFloat(trimmed.slice(lastColon + 1).trim())
+      if (pair && Number.isFinite(val) && val > 0) {
+        overrides[pair] = val
+      }
+    }
+  }
+  return overrides
+}
+
 const globalConfig = {
   db: {
     url: process.env.DATABASE_URL ?? 'postgresql://lens:lens@localhost:5432/lens',
+    connectionLimit: parseInt(process.env.DB_POOL_SIZE ?? '10', 10),
+    poolTimeoutMs: parseInt(process.env.DB_POOL_TIMEOUT_MS ?? '5000', 10),
   },
   redis: {
     url: process.env.REDIS_URL ?? 'redis://localhost:6379',
@@ -380,6 +627,15 @@ const globalConfig = {
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS ?? '5000', 10),
     sdexPageSize: parseInt(process.env.SDEX_PAGE_SIZE ?? '200', 10),
     ammPageSize: parseInt(process.env.AMM_PAGE_SIZE ?? '200', 10),
+    get plausibilityThreshold(): number {
+      return parseFloat(process.env.INGEST_PLAUSIBILITY_THRESHOLD ?? '0.20')
+    },
+    get plausibilityWindowMinutes(): number {
+      return parseInt(process.env.INGEST_PLAUSIBILITY_WINDOW_MINUTES ?? '60', 10)
+    },
+    get plausibilityMinSamples(): number {
+      return parseInt(process.env.INGEST_PLAUSIBILITY_MIN_SAMPLES ?? '1', 10)
+    },
   },
   /**
    * When the publisher writes to the SEP-40 feed.
@@ -417,13 +673,47 @@ const globalConfig = {
     // cheap, pollable summary, so a slightly stale copy is preferable to a
     // per-request scan, but callers must never be shown a minutes-old market.
     snapshotTtl: parseInt(process.env.SNAPSHOT_CACHE_TTL ?? '15', 10),
+    // Issue #495: how long an API-key lookup (positive OR negative) is held in
+    // the in-process auth cache before it must be re-read from Postgres. This
+    // is the worst-case window in which a key revoked on ANOTHER instance can
+    // still authenticate here — on the instance that handles the revoke,
+    // invalidation is immediate. Expiry is re-checked on every cache hit, so
+    // this TTL never extends a key past its own `expiresAt`. Keep it short.
+    apiKeyTtl: parseInt(process.env.API_KEY_CACHE_TTL ?? '30', 10),
+    // How long asset metadata and its verification status are cached. Far
+    // longer than the price TTLs above on purpose: an issuer's home domain and
+    // toml do not move minute to minute, and re-fetching them per request would
+    // put a network round trip in front of every asset lookup.
+    assetTtl: parseInt(process.env.ASSET_CACHE_TTL ?? '3600', 10),
   },
   plausibility: {
     minPrice: parseFloat(process.env.PRICE_MIN_PLAUSIBLE ?? '0.0000000001'),
     maxPrice: parseFloat(process.env.PRICE_MAX_PLAUSIBLE ?? '10000000000'),
   },
+  pricing: {
+    staleThresholdSeconds: parseInt(
+      process.env.PRICE_STALE_THRESHOLD_SECONDS ?? process.env.STALENESS_BOUND_SECONDS ?? '300',
+      10
+    ),
+  },
+  premium: {
+    get stalenessSeconds() {
+      return parseInt(process.env.PREMIUM_STALENESS_SECONDS ?? '60', 10)
+    },
+  },
   http: {
     timeoutMs: parseInt(process.env.HTTP_TIMEOUT_MS ?? '10000', 10),
+  },
+  reconciliation: {
+    intervalMs: parseInt(process.env.RECONCILIATION_INTERVAL_MS ?? '60000', 10),
+    freshnessWindowSeconds: parseInt(process.env.RECONCILIATION_FRESHNESS_SECONDS ?? '300', 10),
+    thresholdPct: parseFloat(process.env.RECONCILIATION_THRESHOLD_PCT ?? '2.0'),
+    cooldownSeconds: parseInt(process.env.RECONCILIATION_ALERT_COOLDOWN_SECONDS ?? '300', 10),
+    pairThresholds: parsePairThresholds(process.env.RECONCILIATION_PAIR_THRESHOLDS),
+  },
+  ws: {
+    pingIntervalMs: parseInt(process.env.WS_PING_INTERVAL_MS ?? '30000', 10),
+    maxMissedPings: parseInt(process.env.WS_MAX_MISSED_PINGS ?? '2', 10),
   },
   outbound: {
     // One operator-maintained list for every outbound fetch the app makes to a
@@ -445,6 +735,7 @@ const globalConfig = {
     maxPageLimit: clampInt(process.env.MCP_MAX_PAGE_LIMIT, 200, 1, 1000),
   },
 } as const
+
 
 // ── Per-network map ───────────────────────────────────────────────────────────
 
@@ -513,8 +804,12 @@ export const config = {
   get network()  { return resolveNetwork(activeNetwork).network },
   get soroswap() { return resolveNetwork(activeNetwork).soroswap },
   get aquarius() { return resolveNetwork(activeNetwork).aquarius },
+  get defindex() { return resolveNetwork(activeNetwork).defindex },
+  get phoenix()  { return resolveNetwork(activeNetwork).phoenix },
   get oracle()   { return resolveNetwork(activeNetwork).oracle },
+  get blend()    { return resolveNetwork(activeNetwork).blend },
   get pairs()    { return resolveNetwork(activeNetwork).pairs },
+  get pegged()   { return resolveNetwork(activeNetwork).pegged },
   get routing()  { return resolveNetwork(activeNetwork).routing },
   get facilitator() { return resolveNetwork(activeNetwork).facilitator },
 
@@ -530,7 +825,16 @@ export const config = {
   publisher: globalConfig.publisher,
   cache:   globalConfig.cache,
   plausibility: globalConfig.plausibility,
+  premium: globalConfig.premium,
   http:    globalConfig.http,
+  reconciliation: globalConfig.reconciliation,
+  ws:      globalConfig.ws,
   outbound: globalConfig.outbound,
   mcp: globalConfig.mcp,
 }
+
+export function getPairReconciliationThreshold(pairKey: string): number {
+  const norm = pairKey.toUpperCase()
+  return config.reconciliation.pairThresholds[norm] ?? config.reconciliation.thresholdPct
+}
+
