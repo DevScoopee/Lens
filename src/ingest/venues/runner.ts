@@ -66,7 +66,13 @@ export async function writeVenuePricePoints(
   publishPriceUpdate({
     pair: pair.pairKey,
     price: currentPrice,
-    ts: latest.timestamp ? latest.timestamp.toISOString() : new Date().toISOString(),
+    ts: latest.sourceTime
+      ? latest.sourceTime.toISOString()
+      : latest.observedAt
+        ? latest.observedAt.toISOString()
+        : latest.timestamp
+          ? latest.timestamp.toISOString()
+          : new Date().toISOString(),
     network,
   })
 

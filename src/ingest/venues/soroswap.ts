@@ -380,7 +380,11 @@ export async function ingestPool(
     publishPriceUpdate({
       pair: pair.pairKey,
       price: spotPrice,
-      ts: inserted[inserted.length - 1].timestamp.toISOString(),
+      ts: (
+        inserted[inserted.length - 1].sourceTime ??
+        inserted[inserted.length - 1].observedAt ??
+        inserted[inserted.length - 1].timestamp
+      ).toISOString(),
       network,
     })
 

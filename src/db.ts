@@ -75,6 +75,8 @@ export interface PricePointWrite {
   baseVolume: number
   counterVolume: number
   ledger: number
+  observedAt?: Date
+  sourceTime?: Date | null
   timestamp: Date
   eventId?: string
 }

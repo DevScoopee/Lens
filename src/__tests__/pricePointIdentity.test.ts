@@ -182,7 +182,7 @@ describe('replaying a batch never stores the same trade twice (#237)', () => {
     expect(fakeTable.length).toBe(2)
   })
 
-  it('uses a single INSERT ... RETURNING statement with ON CONFLICT DO NOTHING', async () => {
+  it('passes skipDuplicates so the batch degrades to ON CONFLICT DO NOTHING', async () => {
     await upsertPricePoints([point(), point({ eventId: 'another-id' })], 'testnet')
 
     expect(mockQuery).toHaveBeenCalledTimes(1)

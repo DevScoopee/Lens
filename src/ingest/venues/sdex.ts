@@ -147,14 +147,16 @@ export async function writeSdexPricePoints(
   trades_ingested_total.inc({ pair: pair.pairKey, network }, inserted.length)
   last_trade_timestamp.set(
     { pair: pair.pairKey, network },
-    Math.floor(latest.timestamp.getTime() / 1000)
+    Math.floor(
+      (latest.sourceTime ?? latest.observedAt ?? latest.timestamp).getTime() / 1000
+    )
   )
   log.info({ pair: pair.pairKey, trades: inserted.length }, 'ingested trades')
 
   publishPriceUpdate({
     pair: pair.pairKey,
     price: currentPrice,
-    ts: latest.timestamp.toISOString(),
+    ts: (latest.sourceTime ?? latest.observedAt ?? latest.timestamp).toISOString(),
     network,
   })
 
