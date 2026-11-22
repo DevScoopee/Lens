@@ -1,7 +1,12 @@
 import { PrismaClient } from '@prisma/client'
 import { Pool } from 'pg'
-import { createHash } from 'node:crypto'
-import { db_query_duration_seconds } from './metrics'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  db_query_duration_seconds,
+  price_points_duplicate_total,
+  price_points_inserted_total,
+  price_rejected_total,
+} from './metrics'
 import { config, type NetworkName } from './config'
 
 // Prisma for schema management + simple queries
@@ -42,8 +47,8 @@ pgPool.query = (async (...args: any[]) => {
  * during a deploy must not store the same observation twice — duplicated
  * trades inflate volume and skew the volume-weighted VWAP. The unique index
  * price_point_identity on (network, source, event_id) makes that impossible at
- * the database level, and `skipDuplicates` turns the write into an idempotent
- * insert (ON CONFLICT DO NOTHING): the replay is absorbed, not errored.
+ * the database level, and ON CONFLICT DO NOTHING turns the write into an
+ * idempotent insert: the replay is absorbed, not errored.
  *
  * The index only catches rows that HAVE an event id — Postgres treats NULLs as
  * distinct in a unique index — so a null eventId would leave a source entirely
@@ -53,31 +58,117 @@ pgPool.query = (async (...args: any[]) => {
  * Horizon trade id / TOID — pass it through unchanged, and snapshot venues
  * without one derive theirs from pool state (see venues/amm.ts and
  * venues/soroswap.ts).
+ *
+ * INSERT ... RETURNING id reports exactly which rows landed. Prisma's
+ * createMany exposes only a count, which cannot tell callers which points were
+ * duplicates — and publishing events for those made quiet pools look active.
+ * The ids are generated here (rather than relying on a database default) so
+ * each input row can be matched to its insertion result by index.
  */
-export async function upsertPricePoints(points: {
-  assetA: string; assetB: string; pairKey: string; source: string
-  poolId?: string; price: number; baseVolume: number; counterVolume: number
-  ledger: number; timestamp: Date; eventId?: string
-}[], network: NetworkName): Promise<number> {
-  if (points.length === 0) return 0
-  const result = await prisma.pricePoint.createMany({
-    data: points.map(p => ({
+export interface PricePointWrite {
+  assetA: string
+  assetB: string
+  pairKey: string
+  source: string
+  poolId?: string
+  price: number
+  baseVolume: number
+  counterVolume: number
+  ledger: number
+  timestamp: Date
+  eventId?: string
+}
+
+export interface PricePointWriteResult {
+  inserted: PricePointWrite[]
+  duplicate: PricePointWrite[]
+  quarantined: PricePointWrite[]
+}
+
+type ResolvedPricePoint = PricePointWrite & { eventId: string }
+
+const PRICE_POINT_COLUMNS = 13
+
+/** Prices outside the configured bounds are never offered to the database. */
+export function isPlausiblePrice(price: number): boolean {
+  return Number.isFinite(price)
+    && price >= config.plausibility.minPrice
+    && price <= config.plausibility.maxPrice
+}
+
+export async function upsertPricePoints(
+  points: PricePointWrite[],
+  network: NetworkName
+): Promise<PricePointWriteResult> {
+  const accepted: ResolvedPricePoint[] = []
+  const quarantined: PricePointWrite[] = []
+  for (const point of points) {
+    if (!isPlausiblePrice(point.price)) {
+      quarantined.push(point)
+      continue
+    }
+    accepted.push({
+      ...point,
+      eventId: point.eventId || synthesizeEventId(network, point),
+    })
+  }
+
+  for (const point of quarantined) {
+    price_rejected_total.inc({
+      pair: point.pairKey, network, venue: point.source, reason: 'out_of_bounds',
+    })
+  }
+  if (accepted.length === 0) return { inserted: [], duplicate: [], quarantined }
+
+  const ids = accepted.map(() => randomUUID())
+  const values: unknown[] = []
+  const tuples = accepted.map((point, i) => {
+    const start = i * PRICE_POINT_COLUMNS + 1
+    values.push(
+      ids[i],
       network,
-      assetA: p.assetA,
-      assetB: p.assetB,
-      pairKey: p.pairKey,
-      source: p.source,
-      poolId: p.poolId ?? null,
-      price: p.price,
-      baseVolume: p.baseVolume,
-      counterVolume: p.counterVolume,
-      ledger: p.ledger,
-      timestamp: p.timestamp,
-      eventId: p.eventId || synthesizeEventId(network, p),
-    })),
-    skipDuplicates: true,
+      point.assetA,
+      point.assetB,
+      point.pairKey,
+      point.source,
+      point.poolId ?? null,
+      point.price,
+      point.baseVolume,
+      point.counterVolume,
+      point.ledger,
+      point.timestamp,
+      point.eventId,
+    )
+    return `($${start}, $${start + 1}, $${start + 2}, $${start + 3}, $${start + 4}, $${start + 5}, $${start + 6}, $${start + 7}, $${start + 8}, $${start + 9}, $${start + 10}, $${start + 11}, $${start + 12})`
   })
-  return result.count
+
+  // One statement keeps the batch atomic: no partial write followed by a
+  // second lookup that could observe a different database state.
+  const result = await pgPool.query<{ id: string }>(
+    `INSERT INTO price_points
+       (id, network, asset_a, asset_b, pair_key, source, pool_id, price, base_volume, counter_volume, ledger, timestamp, event_id)
+     VALUES ${tuples.join(', ')}
+     ON CONFLICT (network, source, event_id) DO NOTHING
+     RETURNING id`,
+    values,
+  )
+
+  const insertedIds = new Set(result.rows.map(row => row.id))
+  const inserted: PricePointWrite[] = []
+  const duplicate: PricePointWrite[] = []
+  accepted.forEach((point, i) => {
+    if (insertedIds.has(ids[i])) inserted.push(point)
+    else duplicate.push(point)
+  })
+
+  for (const point of inserted) {
+    price_points_inserted_total.inc({ source: point.source, network })
+  }
+  for (const point of duplicate) {
+    price_points_duplicate_total.inc({ source: point.source, network })
+  }
+
+  return { inserted, duplicate, quarantined }
 }
 
 /**

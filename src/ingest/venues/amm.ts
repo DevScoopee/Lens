@@ -88,7 +88,7 @@ export async function snapshotPool(
 
     // Also record spot price as a price point (no volume — it's a snapshot, not a trade)
     if (spotPrice > 0) {
-      await upsertPricePoints(
+      const { inserted } = await upsertPricePoints(
         [
           {
             assetA: pair.assetA.code,
@@ -113,7 +113,11 @@ export async function snapshotPool(
         ],
         network
       )
+
+      // Unchanged pool state is a successful poll, not a new observation.
+      // Only a row that landed is announced to subscribers and webhooks.
       markIngestSuccess('AMM', network)
+      if (inserted.length === 0) return
 
       const trackerKey = pair.pairKey
       const { previousPrice } = setLastPrice('AMM', network, trackerKey, spotPrice)
@@ -121,7 +125,7 @@ export async function snapshotPool(
       publishPriceUpdate({
         pair: pair.pairKey,
         price: spotPrice,
-        ts: new Date().toISOString(),
+        ts: inserted[inserted.length - 1].timestamp.toISOString(),
         network,
       })
 
@@ -191,31 +195,36 @@ export async function ingestPoolTrades(
       }
     })
 
+    const { inserted } = await upsertPricePoints(points, network)
+
+    // A replayed page still means Horizon answered; only inserted rows are new
+    // trades and only those get counters or price events.
+    markIngestSuccess('AMM', network)
+
+    const lastRecord = records[records.length - 1]
+    await setIndexerCursor(stateId, lastRecord.paging_token, network, ledgers[ledgers.length - 1])
+    if (inserted.length === 0) return
+
+    const latest = inserted[inserted.length - 1]
     const trackerKey = pair.pairKey
     const { previousPrice, currentPrice } = setLastPrice(
       'AMM',
       network,
       trackerKey,
-      points[points.length - 1].price
+      latest.price
     )
 
-    await upsertPricePoints(points, network)
-    markIngestSuccess('AMM', network)
-
-    trades_ingested_total.inc({ pair: pair.pairKey, network }, points.length)
+    trades_ingested_total.inc({ pair: pair.pairKey, network }, inserted.length)
     last_trade_timestamp.set(
       { pair: pair.pairKey, network },
-      Math.floor(points[points.length - 1].timestamp.getTime() / 1000)
+      Math.floor(latest.timestamp.getTime() / 1000)
     )
-
-    const lastRecord = records[records.length - 1]
-    await setIndexerCursor(stateId, lastRecord.paging_token, network, ledgers[ledgers.length - 1])
-    log.info({ pair: pair.pairKey, pool: pool.id, trades: points.length }, 'ingested pool trades')
+    log.info({ pair: pair.pairKey, pool: pool.id, trades: inserted.length }, 'ingested pool trades')
 
     publishPriceUpdate({
       pair: pair.pairKey,
       price: currentPrice,
-      ts: points[points.length - 1].timestamp.toISOString(),
+      ts: latest.timestamp.toISOString(),
       network,
     })
 

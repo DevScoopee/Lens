@@ -10,7 +10,11 @@
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
 vi.mock('../db', () => ({
-  upsertPricePoints: vi.fn().mockResolvedValue(undefined),
+  upsertPricePoints: vi.fn().mockImplementation((points: any[]) => ({
+    inserted: points,
+    duplicate: [],
+    quarantined: [],
+  })),
 }))
 
 const mockLogger = vi.hoisted(() => ({
@@ -28,6 +32,10 @@ vi.mock('../logger', () => ({
 
 vi.mock('../webhookDispatcher', () => ({
   dispatchPriceUpdate: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('../events', () => ({
+  publishPriceUpdate: vi.fn(),
 }))
 
 vi.mock('../ingesters/soroswap', async (importOriginal) => {
@@ -59,6 +67,7 @@ import {
 } from '../ingesters/soroswap'
 import { upsertPricePoints } from '../db'
 import { dispatchPriceUpdate } from '../webhookDispatcher'
+import { publishPriceUpdate } from '../events'
 import { price_rejected_total } from '../metrics'
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -170,7 +179,11 @@ describe('ingestPool', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
-    ;(upsertPricePoints as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
+    ;(upsertPricePoints as ReturnType<typeof vi.fn>).mockImplementation((points: any[]) => ({
+      inserted: points,
+      duplicate: [],
+      quarantined: [],
+    }))
   })
 
   it('stores a price point when reserves are non-zero', async () => {
@@ -193,6 +206,27 @@ describe('ingestPool', () => {
     expect(dispatchPriceUpdate).toHaveBeenCalledWith(
       expect.objectContaining({ assetA: 'XLM', assetB: 'USDC' })
     )
+  })
+
+  it('publishes one update for an unchanged pool polled ten times', async () => {
+    const mockFetch = vi.fn().mockResolvedValue([10_000_000n, 2_000_000n])
+
+    await ingestPool(mockPoolEntry, mockPair as any, mockFetch, 'mainnet')
+    expect(publishPriceUpdate).toHaveBeenCalledTimes(1)
+
+    // The same reserve state re-derives the same identity, so every later poll
+    // is a duplicate. None of them may look like a fresh price observation.
+    ;(upsertPricePoints as ReturnType<typeof vi.fn>).mockImplementation((points: any[]) => ({
+      inserted: [],
+      duplicate: points,
+      quarantined: [],
+    }))
+    for (let poll = 0; poll < 9; poll++) {
+      await ingestPool(mockPoolEntry, mockPair as any, mockFetch, 'mainnet')
+    }
+
+    expect(publishPriceUpdate).toHaveBeenCalledTimes(1)
+    expect(dispatchPriceUpdate).toHaveBeenCalledTimes(1)
   })
 
   it('skips price storage when pool is empty (zero reserves)', async () => {

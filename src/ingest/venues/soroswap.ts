@@ -343,7 +343,7 @@ export async function ingestPool(
       return
     }
 
-    await upsertPricePoints(
+    const { inserted } = await upsertPricePoints(
       [
         {
           assetA: pair.assetA.code,
@@ -365,17 +365,22 @@ export async function ingestPool(
           eventId: `soroswap-${poolEntry.poolAddress}-${reserveA}-${reserveB}`,
         },
       ],
-      network
-    )
+        network
+      )
+
+    // The RPC poll succeeded even when the reserves were unchanged. Announce
+    // a price update only when a new observation was actually stored.
     markIngestSuccess('Soroswap', network)
+    if (inserted.length === 0) return
 
     const trackerKey = pair.pairKey
     const { previousPrice } = setLastPrice('Soroswap', network, trackerKey, spotPrice)
 
+
     publishPriceUpdate({
       pair: pair.pairKey,
       price: spotPrice,
-      ts: new Date().toISOString(),
+      ts: inserted[inserted.length - 1].timestamp.toISOString(),
       network,
     })
 

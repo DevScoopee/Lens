@@ -131,25 +131,30 @@ export async function writeSdexPricePoints(
   if (points.length === 0) return
 
   const stateId = `sdex:${network}:${pair.pairKey}`
-  const trackerKey = pair.pairKey
-  const { previousPrice, currentPrice } = setLastPrice('SDEX', network, trackerKey, points[points.length - 1].price)
+  const { inserted } = await upsertPricePoints(points, network)
 
-  await upsertPricePoints(points, network)
+  // The page was fetched successfully even when every row was a replay. That
+  // is liveness, not new data: only `inserted` rows move counters or events.
   markIngestSuccess('SDEX', network)
 
-  trades_ingested_total.inc({ pair: pair.pairKey, network }, points.length)
+  await setIndexerCursor(stateId, lastPagingToken, network, finalLedger)
+  if (inserted.length === 0) return
+
+  const latest = inserted[inserted.length - 1]
+  const trackerKey = pair.pairKey
+  const { previousPrice, currentPrice } = setLastPrice('SDEX', network, trackerKey, latest.price)
+
+  trades_ingested_total.inc({ pair: pair.pairKey, network }, inserted.length)
   last_trade_timestamp.set(
     { pair: pair.pairKey, network },
-    Math.floor(points[points.length - 1].timestamp.getTime() / 1000)
+    Math.floor(latest.timestamp.getTime() / 1000)
   )
-
-  await setIndexerCursor(stateId, lastPagingToken, network, finalLedger)
-  log.info({ pair: pair.pairKey, trades: points.length }, 'ingested trades')
+  log.info({ pair: pair.pairKey, trades: inserted.length }, 'ingested trades')
 
   publishPriceUpdate({
     pair: pair.pairKey,
     price: currentPrice,
-    ts: points[points.length - 1].timestamp.toISOString(),
+    ts: latest.timestamp.toISOString(),
     network,
   })
 

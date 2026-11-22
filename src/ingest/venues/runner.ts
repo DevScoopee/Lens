@@ -52,10 +52,15 @@ export async function writeVenuePricePoints(
 ): Promise<void> {
   if (points.length === 0) return
 
-  await upsertPricePoints(points as any, network)
-  markIngestSuccess(venue, network)
+  const { inserted } = await upsertPricePoints(points, network)
 
-  const latest = points[points.length - 1]
+  // A duplicate-only cycle still proves the venue answered and the ingester is
+  // alive, so liveness is recorded here. New data is a separate signal: the
+  // events below fire only for points that actually landed.
+  markIngestSuccess(venue, network)
+  if (inserted.length === 0) return
+
+  const latest = inserted[inserted.length - 1]
   const { previousPrice, currentPrice } = setLastPrice(venue, network, pair.pairKey, latest.price)
 
   publishPriceUpdate({
