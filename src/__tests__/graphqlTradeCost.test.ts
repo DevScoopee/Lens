@@ -380,7 +380,7 @@ describe('GraphQL trade-cost queries (#683)', () => {
       const missingIssuer = await post(app, `{ book(assetA: "XLM", assetB: "USDC") { status } }`)
       expect(missingIssuer.errors[0].extensions.code).toBe('INVALID_INPUT')
       expect(missingIssuer.errors[0].extensions.field).toBe('assetB')
-      expect(missingIssuer.errors[0].extensions.message).toMatch(/issuer/i)
+      expect(missingIssuer.errors[0].message).toMatch(/issuer/i)
     })
   })
 
