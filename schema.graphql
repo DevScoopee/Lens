@@ -346,9 +346,9 @@ type ImpactResult {
   assetB: String!
   pairKey: String!
   network: String!
-  spotPrice: Float
-  availableLiquidity: Float
-  smallestSize: Float
+  spotPrice: Float!
+  availableLiquidity: Float!
+  smallestSize: Float!
   ladder: [ImpactPoint!]!
   thresholds: [ImpactThreshold!]!
   source: String!
